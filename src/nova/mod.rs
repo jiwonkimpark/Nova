@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 mod circuit;
 pub mod nifs;
 
+use crate::traits::PrimeFieldExt;
 use circuit::{NovaAugmentedCircuit, NovaAugmentedCircuitInputs};
 use nifs::{NIFSRelaxed, NIFS};
 
@@ -336,9 +337,14 @@ where
 
   l_w_secondary: R1CSWitness<E2>,
   l_u_secondary: R1CSInstance<E2>,
+  com_i_secondary: E2::Scalar,
 
-  i: usize,
+  l_w_primary: R1CSWitness<E1>,
+  l_u_primary: R1CSInstance<E1>,
+  com_i_primary: E1::Scalar,
 
+  is_base_case: bool,
+  // i: usize,
   zi: Vec<E1::Scalar>,
 
   _p: PhantomData<C>,
@@ -359,7 +365,15 @@ where
     let ri_primary = E1::Scalar::random(&mut OsRng);
     let ri_secondary = E2::Scalar::random(&mut OsRng);
 
-    // base case for the primary
+    let r_i_next_primary = E1::Scalar::random(&mut OsRng);
+    let r_i_next_secondary = E2::Scalar::random(&mut OsRng);
+
+    let mut bytes = [0u8; 64];
+    bytes[31] = 0x40;
+    let two_pow_254_e1 = E1::Scalar::from_uniform(&bytes);
+
+    let n = two_pow_254_e1; // TODO: change
+                            // base case for the primary
     let mut cs_primary = SatisfyingAssignment::<E1>::new();
     let inputs_primary: NovaAugmentedCircuitInputs<E2> = NovaAugmentedCircuitInputs::new(
       scalar_as_base::<E1>(pp.digest()),
@@ -371,6 +385,9 @@ where
       ri_primary, // "r next"
       None,
       None,
+      n,
+      None,
+      r_i_next_primary,
     );
 
     let circuit_primary: NovaAugmentedCircuit<'_, E2, C> = NovaAugmentedCircuit::new(
@@ -379,11 +396,14 @@ where
       c,
       pp.ro_consts_circuit_primary.clone(),
     );
-    let zi_primary = circuit_primary.synthesize(&mut cs_primary)?;
+    let (zi_primary, com_i_primary) = circuit_primary.synthesize(&mut cs_primary)?;
     let (u_primary, w_primary) =
       cs_primary.r1cs_instance_and_witness(&pp.r1cs_shape_primary, &pp.ck_primary, &mut OsRng)?;
 
-    // base case for the secondary
+    let two_pow_254_e2 = E2::Scalar::from_uniform(&bytes);
+
+    let n = two_pow_254_e2; // TODO: change
+                            // base case for the secondary
     let mut cs_secondary = SatisfyingAssignment::<E2>::new();
     let inputs_secondary: NovaAugmentedCircuitInputs<E1> = NovaAugmentedCircuitInputs::new(
       pp.digest(),
@@ -395,6 +415,9 @@ where
       ri_secondary, // "r next"
       Some(u_primary.clone()),
       None,
+      n,
+      None,
+      r_i_next_secondary,
     );
     let tc = TrivialCircuit::<E2::Scalar>::default();
     let circuit_secondary: NovaAugmentedCircuit<'_, E1, _> = NovaAugmentedCircuit::new(
@@ -403,7 +426,7 @@ where
       &tc,
       pp.ro_consts_circuit_secondary.clone(),
     );
-    let _ = circuit_secondary.synthesize(&mut cs_secondary)?;
+    let (_, com_i_secondary) = circuit_secondary.synthesize(&mut cs_secondary)?;
     let (u_secondary, w_secondary) = cs_secondary.r1cs_instance_and_witness(
       &pp.r1cs_shape_secondary,
       &pp.ck_secondary,
@@ -446,8 +469,17 @@ where
 
       l_w_secondary,
       l_u_secondary,
+      com_i_secondary: com_i_secondary
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?,
 
-      i: 0,
+      l_w_primary,
+      l_u_primary,
+      com_i_primary: com_i_primary
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?,
+
+      is_base_case: true,
 
       zi: zi_primary,
 
@@ -458,8 +490,8 @@ where
   /// Updates the provided `RecursiveSNARK` by executing a step of the incremental computation
   pub fn prove_step(&mut self, pp: &PublicParams<E1, E2, C>, c: &C) -> Result<(), NovaError> {
     // first step was already done in the constructor
-    if self.i == 0 {
-      self.i = 1;
+    if self.is_base_case {
+      self.is_base_case = false;
       return Ok(());
     }
 
@@ -477,10 +509,17 @@ where
 
     let r_next_primary = E1::Scalar::random(&mut OsRng);
 
+    let mut bytes = [0u8; 64];
+    bytes[31] = 0x40;
+    let two_pow_254_e1 = E1::Scalar::from_uniform(&bytes);
+
+    let n = two_pow_254_e1; // TODO: change
+    let ri_next_primary = E1::Scalar::random(&mut OsRng);
+
     let mut cs_primary = SatisfyingAssignment::<E1>::new();
     let inputs_primary: NovaAugmentedCircuitInputs<E2> = NovaAugmentedCircuitInputs::new(
       scalar_as_base::<E1>(pp.digest()),
-      E1::Scalar::from(self.i as u64),
+      self.l_w_primary.W[2], // iteration-hiding: get i from witness
       self.z0.to_vec(),
       Some(self.zi.clone()),
       Some(self.r_U_secondary.clone()),
@@ -488,6 +527,9 @@ where
       r_next_primary,
       Some(self.l_u_secondary.clone()),
       Some(nifs_secondary.comm_T),
+      n,
+      Some(self.l_w_primary.W[4]),
+      ri_next_primary,
     );
 
     let circuit_primary: NovaAugmentedCircuit<'_, E2, C> = NovaAugmentedCircuit::new(
@@ -496,7 +538,7 @@ where
       c,
       pp.ro_consts_circuit_primary.clone(),
     );
-    let zi_primary = circuit_primary.synthesize(&mut cs_primary)?;
+    let (zi_primary, com_i_primary) = circuit_primary.synthesize(&mut cs_primary)?;
 
     let (l_u_primary, l_w_primary) =
       cs_primary.r1cs_instance_and_witness(&pp.r1cs_shape_primary, &pp.ck_primary, &mut OsRng)?;
@@ -514,18 +556,25 @@ where
     )?;
 
     let r_next_secondary = E2::Scalar::random(&mut OsRng);
+    let ri_next_secondary = E2::Scalar::random(&mut OsRng);
+
+    let two_pow_254_e2 = E2::Scalar::from_uniform(&bytes);
+    let n = two_pow_254_e2; // TODO: change
 
     let mut cs_secondary = SatisfyingAssignment::<E2>::new();
     let inputs_secondary: NovaAugmentedCircuitInputs<E1> = NovaAugmentedCircuitInputs::new(
       pp.digest(),
-      E2::Scalar::from(self.i as u64),
+      self.l_w_secondary.W[2], // iteration-hiding: get i from witness
       vec![E2::Scalar::ZERO],
       Some(vec![E2::Scalar::ZERO]),
       Some(self.r_U_primary.clone()),
       Some(self.ri_secondary),
       r_next_secondary,
-      Some(l_u_primary),
+      Some(l_u_primary.clone()),
       Some(nifs_primary.comm_T),
+      n,
+      Some(self.l_w_secondary.W[4]),
+      ri_next_secondary,
     );
 
     let tc = TrivialCircuit::<E2::Scalar>::default();
@@ -535,7 +584,7 @@ where
       &tc,
       pp.ro_consts_circuit_secondary.clone(),
     );
-    let _ = circuit_secondary.synthesize(&mut cs_secondary)?;
+    let (_, com_i_secondary) = circuit_secondary.synthesize(&mut cs_secondary)?;
 
     let (l_u_secondary, l_w_secondary) = cs_secondary
       .r1cs_instance_and_witness(&pp.r1cs_shape_secondary, &pp.ck_secondary, &mut OsRng)
@@ -551,11 +600,18 @@ where
 
     self.l_u_secondary = l_u_secondary;
     self.l_w_secondary = l_w_secondary;
+    self.com_i_secondary = com_i_secondary
+      .get_value()
+      .ok_or(SynthesisError::AssignmentMissing)?;
+
+    self.l_u_primary = l_u_primary;
+    self.l_w_primary = l_w_primary;
+    self.com_i_primary = com_i_primary
+      .get_value()
+      .ok_or(SynthesisError::AssignmentMissing)?;
 
     self.r_U_primary = r_U_primary;
     self.r_W_primary = r_W_primary;
-
-    self.i += 1;
 
     self.r_U_secondary = r_U_secondary;
     self.r_W_secondary = r_W_secondary;
@@ -567,18 +623,15 @@ where
   }
 
   /// Verify the correctness of the `RecursiveSNARK`
+  ///
+  /// The step count is hidden behind a commitment carried in the proof, so `_num_steps`
+  /// is not checked; the parameter is kept for API compatibility.
   pub fn verify(
     &self,
     pp: &PublicParams<E1, E2, C>,
-    num_steps: usize,
+    _num_steps: usize,
     z0: &[E1::Scalar],
   ) -> Result<Vec<E1::Scalar>, NovaError> {
-    // number of steps cannot be zero
-    let is_num_steps_zero = num_steps == 0;
-
-    // check if the provided proof has executed num_steps
-    let is_num_steps_not_match = self.i != num_steps;
-
     // check if the initial inputs match
     let is_inputs_not_match = self.z0 != z0;
 
@@ -587,8 +640,7 @@ where
       || self.r_U_primary.X.len() != 2
       || self.r_U_secondary.X.len() != 2;
 
-    if is_num_steps_zero
-      || is_num_steps_not_match
+    if self.is_base_case
       || is_inputs_not_match
       || z0.len() != pp.F_arity
       || self.z0.len() != pp.F_arity
@@ -604,7 +656,6 @@ where
     let (hash_primary, hash_secondary) = {
       let mut hasher = <E2 as Engine>::RO::new(pp.ro_consts_secondary.clone());
       hasher.absorb(pp.digest());
-      hasher.absorb(E1::Scalar::from(num_steps as u64));
       for e in z0 {
         hasher.absorb(*e);
       }
@@ -614,13 +665,24 @@ where
       self.r_U_secondary.absorb_in_ro(&mut hasher);
       hasher.absorb(self.ri_primary);
 
+      let mut bytes = [0u8; 64];
+      bytes[31] = 0x40;
+      let two_pow_254_e1 = E1::Scalar::from_uniform(&bytes);
+
+      hasher.absorb(two_pow_254_e1);
+      hasher.absorb(self.com_i_primary);
+
       let mut hasher2 = <E1 as Engine>::RO::new(pp.ro_consts_primary.clone());
       hasher2.absorb(scalar_as_base::<E1>(pp.digest()));
-      hasher2.absorb(E2::Scalar::from(num_steps as u64));
       hasher2.absorb(E2::Scalar::ZERO);
       hasher2.absorb(E2::Scalar::ZERO);
       self.r_U_primary.absorb_in_ro(&mut hasher2);
       hasher2.absorb(self.ri_secondary);
+
+      let two_pow_254_e2 = E2::Scalar::from_uniform(&bytes);
+      hasher2.absorb(two_pow_254_e2);
+
+      hasher2.absorb(self.com_i_secondary);
 
       (
         hasher.squeeze(NUM_HASH_BITS, false),
@@ -673,11 +735,6 @@ where
   /// Get the outputs after the last step of computation.
   pub fn outputs(&self) -> &[E1::Scalar] {
     &self.zi
-  }
-
-  /// The number of steps which have been executed thus far.
-  pub fn num_steps(&self) -> usize {
-    self.i
   }
 }
 
@@ -734,6 +791,7 @@ where
   ri_secondary: E2::Scalar,
   l_u_secondary: R1CSInstance<E2>,
   nifs_Uf_secondary: NIFS<E2>,
+  com_i_secondary: E2::Scalar,
 
   l_ur_secondary: RelaxedR1CSInstance<E2>,
   nifs_Un_secondary: NIFSRelaxed<E2>,
@@ -742,6 +800,7 @@ where
   ri_primary: E1::Scalar,
   l_ur_primary: RelaxedR1CSInstance<E1>,
   nifs_Un_primary: NIFSRelaxed<E1>,
+  com_i_primary: E1::Scalar,
 
   wit_blind_r_Wn_primary: E1::Scalar,
   err_blind_r_Wn_primary: E1::Scalar,
@@ -888,6 +947,7 @@ where
       ri_secondary: recursive_snark.ri_secondary,
       l_u_secondary: recursive_snark.l_u_secondary.clone(),
       nifs_Uf_secondary: nifs_Uf_secondary.clone(),
+      com_i_secondary: recursive_snark.com_i_secondary.clone(),
 
       l_ur_secondary: l_ur_secondary.clone(),
       nifs_Un_secondary: nifs_Un_secondary.clone(),
@@ -896,6 +956,7 @@ where
       ri_primary: recursive_snark.ri_primary,
       l_ur_primary: l_ur_primary.clone(),
       nifs_Un_primary: nifs_Un_primary.clone(),
+      com_i_primary: recursive_snark.com_i_primary.clone(),
 
       wit_blind_r_Wn_primary,
       err_blind_r_Wn_primary,
@@ -947,7 +1008,7 @@ where
     let (hash_primary, hash_secondary) = {
       let mut hasher = <E2 as Engine>::RO::new(vk.ro_consts_secondary.clone());
       hasher.absorb(vk.pp_digest);
-      hasher.absorb(E1::Scalar::from(num_steps as u64));
+      // hasher.absorb(E1::Scalar::from(num_steps as u64));
       for e in z0 {
         hasher.absorb(*e);
       }
@@ -957,13 +1018,25 @@ where
       self.r_U_secondary.absorb_in_ro(&mut hasher);
       hasher.absorb(self.ri_primary);
 
+      let mut bytes = [0u8; 64];
+      bytes[31] = 0x40;
+      let two_pow_254_e1 = E1::Scalar::from_uniform(&bytes);
+
+      hasher.absorb(two_pow_254_e1);
+
+      hasher.absorb(self.com_i_primary);
+
       let mut hasher2 = <E1 as Engine>::RO::new(vk.ro_consts_primary.clone());
       hasher2.absorb(scalar_as_base::<E1>(vk.pp_digest));
-      hasher2.absorb(E2::Scalar::from(num_steps as u64));
       hasher2.absorb(E2::Scalar::ZERO);
       hasher2.absorb(E2::Scalar::ZERO);
       self.r_U_primary.absorb_in_ro(&mut hasher2);
       hasher2.absorb(self.ri_secondary);
+
+      let two_pow_254_e2 = E2::Scalar::from_uniform(&bytes);
+      hasher2.absorb(two_pow_254_e2);
+
+      hasher2.absorb(self.com_i_secondary);
 
       (
         hasher.squeeze(NUM_HASH_BITS, false),
@@ -1137,17 +1210,17 @@ mod tests {
   fn test_pp_digest() {
     test_pp_digest_with::<PallasEngine, VestaEngine, _>(
       &TrivialCircuit::<_>::default(),
-      &expect!["5e8f9428786cf553693b71f43bbc810f4140a55891d63e50f764b299467b5800"],
+      &expect!["e834fd7d05c450855c065a06f40fa07b14306dcdc53b83b4377f4fcb2283d103"],
     );
 
     test_pp_digest_with::<Bn256EngineIPA, GrumpkinEngine, _>(
       &TrivialCircuit::<_>::default(),
-      &expect!["05d7396a6d9d795b73d60e26cd5738ed103951ff8da4b75c322f03d1c3097702"],
+      &expect!["c8d1959e2c6c87f9abd6e1b699971bf28195112b83275b00d14a2c87eb220c01"],
     );
 
     test_pp_digest_with::<Secp256k1Engine, Secq256k1Engine, _>(
       &TrivialCircuit::<_>::default(),
-      &expect!["489310e7fe179a1e6908e2d89bd4b2089fa116ff0050993c8d8a3997ccabb000"],
+      &expect!["ee0bcd240be5c86decdc4d8af6b8de5dee64a2258e97636cc49517aa3d86f601"],
     );
   }
 
@@ -1193,6 +1266,58 @@ mod tests {
     test_ivc_trivial_with::<PallasEngine, VestaEngine>();
     test_ivc_trivial_with::<Bn256EngineKZG, GrumpkinEngine>();
     test_ivc_trivial_with::<Secp256k1Engine, Secq256k1Engine>();
+  }
+
+  fn test_ivc_trivial_with_compression_with<E1, E2, EE1, EE2>()
+  where
+    E1: Engine<Base = <E2 as Engine>::Scalar>,
+    E2: Engine<Base = <E1 as Engine>::Scalar>,
+    EE1: EvaluationEngineTrait<E1>,
+    EE2: EvaluationEngineTrait<E2>,
+  {
+    let test_circuit = TrivialCircuit::<<E1 as Engine>::Scalar>::default();
+
+    // produce public parameters
+    let pp = PublicParams::<E1, E2, TrivialCircuit<<E1 as Engine>::Scalar>>::setup(
+      &test_circuit,
+      &*default_ck_hint(),
+      &*default_ck_hint(),
+    )
+    .unwrap();
+
+    let num_steps = 3;
+
+    // produce a recursive SNARK
+    let mut recursive_snark =
+      RecursiveSNARK::new(&pp, &test_circuit, &[<E1 as Engine>::Scalar::ZERO]).unwrap();
+
+    for i in 0..num_steps {
+      let res = recursive_snark.prove_step(&pp, &test_circuit);
+      assert!(res.is_ok());
+
+      // verify the recursive SNARK
+      let res = recursive_snark.verify(&pp, i + 1, &[<E1 as Engine>::Scalar::ZERO]);
+      assert!(res.is_ok());
+    }
+
+    // produce the prover and verifier keys for compressed snark
+    let (pk, vk) = CompressedSNARK::<_, _, _, S<E1, EE1>, S<E2, EE2>>::setup(&pp).unwrap();
+
+    // produce a compressed SNARK
+    let res = CompressedSNARK::<_, _, _, S<E1, EE1>, S<E2, EE2>>::prove(&pp, &pk, &recursive_snark);
+    assert!(res.is_ok());
+    let compressed_snark = res.unwrap();
+
+    // verify the compressed SNARK
+    let res = compressed_snark.verify(&vk, num_steps, &[<E1 as Engine>::Scalar::ZERO]);
+    assert!(res.is_ok());
+  }
+
+  #[test]
+  fn test_ivc_trivial_with_compression() {
+    test_ivc_trivial_with_compression_with::<PallasEngine, VestaEngine, EE<_>, EE<_>>();
+    test_ivc_trivial_with_compression_with::<Bn256EngineKZG, GrumpkinEngine, EEPrime<_>, EE<_>>();
+    test_ivc_trivial_with_compression_with::<Secp256k1Engine, Secq256k1Engine, EE<_>, EE<_>>();
   }
 
   /// A `RecursiveSNARK` whose witness vectors do not match the shape must be

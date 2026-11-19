@@ -1,11 +1,11 @@
 //! Gadgets representing numbers in the scalar field of the underlying curve.
 
+use crate::frontend::{ConstraintSystem, LinearCombination, SynthesisError, Variable};
 use ff::{PrimeField, PrimeFieldBits};
 use serde::{Deserialize, Serialize};
 
-use crate::frontend::{ConstraintSystem, LinearCombination, SynthesisError, Variable};
-
 use crate::frontend::gadgets::boolean::{self, AllocatedBit, Boolean};
+use crate::gadgets::nonnative::util::f_to_nat;
 
 /// Represents an allocated number in the circuit.
 #[derive(Debug, Serialize, Deserialize)]
@@ -137,6 +137,19 @@ impl<Scalar: PrimeField> AllocatedNum<Scalar> {
       |lc| lc + CS::one(),
       |lc| lc + self.variable,
     );
+
+    Ok(())
+  }
+
+  /// Make [`AllocatedNum`] a private witness.
+  pub fn witnessize<CS>(&self, mut cs: CS) -> Result<(), SynthesisError>
+  where
+    CS: ConstraintSystem<Scalar>,
+  {
+    cs.alloc(
+      || "witness variable",
+      || self.value.ok_or(SynthesisError::AssignmentMissing),
+    )?;
 
     Ok(())
   }
@@ -364,6 +377,65 @@ impl<Scalar: PrimeField> AllocatedNum<Scalar> {
       value,
       variable: var,
     })
+  }
+
+  /// Outputs less than result
+  pub fn less_than<CS>(&self, mut cs: CS, other: &Self) -> Result<AllocatedBit, SynthesisError>
+  where
+    CS: ConstraintSystem<Scalar>,
+    Scalar: PrimeFieldBits,
+  {
+    let bool_value = match (self.get_value(), other.get_value()) {
+      (Some(a), Some(b)) => {
+        let a_nat = f_to_nat(&a);
+        let b_nat = f_to_nat(&b);
+
+        if a_nat < b_nat {
+          Some(true)
+        } else {
+          Some(false)
+        }
+      }
+      _ => None,
+    };
+
+    let lt = AllocatedBit::alloc(cs.namespace(|| "lt a < b"), bool_value)?;
+
+    let a_bits = self.to_bits_le(cs.namespace(|| "a_bits"))?;
+    let b_bits = other.to_bits_le(cs.namespace(|| "b_bits"))?;
+
+    let bit_len = a_bits.len();
+    let mut less = Boolean::constant(false);
+    let mut equal = Boolean::constant(true);
+
+    for i in (0..bit_len).rev() {
+      let ai = &a_bits[i];
+      let bi = &b_bits[i];
+
+      let not_ai = ai.not();
+      let ai_lt_bi = Boolean::and(cs.namespace(|| format!("not_ai_and_bi_{}", i)), &not_ai, bi)?;
+      let new_less = Boolean::and(
+        cs.namespace(|| format!("new_less_{}", i)),
+        &ai_lt_bi,
+        &equal,
+      )?;
+      less = Boolean::or(
+        cs.namespace(|| format!("less_or_new_{}", i)),
+        &less,
+        &new_less,
+      )?;
+
+      let ai_eq_bi = Boolean::xor(cs.namespace(|| format!("xor_ai_bi_{}", i)), ai, bi)?.not();
+      equal = Boolean::and(
+        cs.namespace(|| format!("update_equal_{}", i)),
+        &equal,
+        &ai_eq_bi,
+      )?;
+    }
+
+    Boolean::enforce_equal(cs, &less, &Boolean::from(lt.clone()))?;
+
+    Ok(lt)
   }
 
   /// Squares an allocated number, returning a new allocated number.
