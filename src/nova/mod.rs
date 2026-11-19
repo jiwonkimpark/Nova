@@ -947,7 +947,7 @@ where
       ri_secondary: recursive_snark.ri_secondary,
       l_u_secondary: recursive_snark.l_u_secondary.clone(),
       nifs_Uf_secondary: nifs_Uf_secondary.clone(),
-      com_i_secondary: recursive_snark.com_i_secondary.clone(),
+      com_i_secondary: recursive_snark.com_i_secondary,
 
       l_ur_secondary: l_ur_secondary.clone(),
       nifs_Un_secondary: nifs_Un_secondary.clone(),
@@ -956,7 +956,7 @@ where
       ri_primary: recursive_snark.ri_primary,
       l_ur_primary: l_ur_primary.clone(),
       nifs_Un_primary: nifs_Un_primary.clone(),
-      com_i_primary: recursive_snark.com_i_primary.clone(),
+      com_i_primary: recursive_snark.com_i_primary,
 
       wit_blind_r_Wn_primary,
       err_blind_r_Wn_primary,
